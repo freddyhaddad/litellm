@@ -2442,6 +2442,70 @@ async def _lookup_deprecated_key(
     return None
 
 
+# ------------------------------------------------------------------ #
+# LiteLLM_Config param_name cache
+#
+# `get_generic_data(table_name="config", ...)` + several direct
+# `litellm_config.find_first(...)` callers fire on every scheduler
+# tick (~30s) and on most admin HTTP routes. At 200-pod scale the
+# per-tick N+1 pattern produced ~530 qps cluster-wide on the
+# `config` table — none of it changing between ticks.
+#
+# This is a DualCache: in-memory for sub-millisecond hits, Redis
+# for cross-pod sharing so a freshly booted pod can warm from Redis
+# instead of hitting Postgres, and so the cluster only pays one DB
+# read per TTL window per param even at 200-pod scale.
+#
+# Cache values are stored as JSON-serializable dicts (so they round
+# trip through Redis cleanly):
+#   - {"param_name": str, "param_value": Any}    — hit, row exists
+#   - the literal string _CONFIG_PARAM_CACHE_MISS — hit, row absent
+#   (None reply from get_cache() means "not in cache / expired")
+# `_ConfigRow` wraps a hit dict so callers can keep using
+# `.param_name` / `.param_value` exactly like a Prisma row.
+# ------------------------------------------------------------------ #
+_CONFIG_PARAM_CACHE_TTL_SECONDS: int = int(
+    os.environ.get("LITELLM_CONFIG_PARAM_CACHE_TTL_SECONDS", "60")
+)
+# Stored in cache instead of None when a param is known-absent in DB.
+# Plain string so Redis serialization is trivial.
+_CONFIG_PARAM_CACHE_MISS: str = "__litellm_config_param_miss__"
+
+
+def _config_cache_key(param_name: str) -> str:
+    return f"litellm_config:param:{param_name}"
+
+
+class _ConfigRow:
+    """
+    Thin shim that mimics the Prisma `litellm_config` row shape
+    (`.param_name`, `.param_value`) for cached values that have been
+    serialized as plain dicts. Lets every caller of `get_generic_data`
+    continue using `row.param_value` regardless of whether the value
+    came from DB or from cache.
+    """
+
+    __slots__ = ("param_name", "param_value")
+
+    def __init__(self, param_name: str, param_value: Any) -> None:
+        self.param_name = param_name
+        self.param_value = param_value
+
+
+def _row_to_cache_value(row: Any) -> Dict[str, Any]:
+    """Pack a Prisma row (or _ConfigRow) for cache storage."""
+    return {"param_name": row.param_name, "param_value": row.param_value}
+
+
+def _cache_value_to_row(cached: Any) -> Optional[_ConfigRow]:
+    """Unpack a cached entry. None for not-in-cache; sentinel str for known-miss."""
+    if cached is None or cached == _CONFIG_PARAM_CACHE_MISS:
+        return None
+    if isinstance(cached, dict):
+        return _ConfigRow(cached["param_name"], cached["param_value"])
+    return None
+
+
 class PrismaClient:
     spend_log_transactions: List = []
     _spend_log_transactions_lock = asyncio.Lock()
@@ -2454,6 +2518,18 @@ class PrismaClient:
     ):
         ## init logging object
         self.proxy_logging_obj = proxy_logging_obj
+        # DualCache for LiteLLM_Config `param_name` reads. In-memory layer
+        # gives sub-millisecond local hits; the Redis layer (attached at
+        # startup in proxy_server.py — see the spend_counter_cache pattern)
+        # makes the cache cluster-wide so a freshly-booted pod can warm
+        # from Redis instead of hitting Postgres. See the module-level
+        # comment near _CONFIG_PARAM_CACHE_TTL_SECONDS for rationale.
+        from litellm.caching.dual_cache import DualCache
+
+        self._config_param_cache = DualCache(
+            default_in_memory_ttl=_CONFIG_PARAM_CACHE_TTL_SECONDS,
+            default_redis_ttl=_CONFIG_PARAM_CACHE_TTL_SECONDS,
+        )
         self.iam_token_db_auth: Optional[bool] = str_to_bool(
             os.getenv("IAM_TOKEN_DB_AUTH")
         )
@@ -2678,6 +2754,53 @@ class PrismaClient:
             raise
         return
 
+    async def get_generic_data(
+        self,
+        key: str,
+        value: Any,
+        table_name: Literal["users", "keys", "config", "spend"],
+    ):
+        """
+        Generic implementation of get data.
+
+        For `table_name="config"` with `key="param_name"` the DualCache
+        `_config_param_cache` is consulted first (in-memory then Redis);
+        see the module-level comment near _CONFIG_PARAM_CACHE_TTL_SECONDS.
+        Returns either a Prisma row, a `_ConfigRow` shim (cache hit), or
+        None.
+
+        Cache hits return BEFORE delegating to `_get_generic_data_from_db`,
+        which is where `@log_db_metrics` and `@backoff` live — so cache
+        hits do not record sub-millisecond "DB" service events that would
+        otherwise pollute DB latency dashboards in deployments with a
+        warm cache.
+        """
+        config_cache_key: Optional[str] = None
+        if table_name == "config" and key == "param_name":
+            config_cache_key = _config_cache_key(str(value))
+            cached = await self._config_param_cache.async_get_cache(config_cache_key)
+            if cached is not None:
+                # `cached == _CONFIG_PARAM_CACHE_MISS` → known absent
+                # else → dict packed by _row_to_cache_value
+                return _cache_value_to_row(cached)
+
+        response = await self._get_generic_data_from_db(
+            key=key, value=value, table_name=table_name
+        )
+
+        if config_cache_key is not None:
+            cache_value: Any = (
+                _row_to_cache_value(response)
+                if response is not None
+                else _CONFIG_PARAM_CACHE_MISS
+            )
+            await self._config_param_cache.async_set_cache(
+                config_cache_key,
+                cache_value,
+                ttl=_CONFIG_PARAM_CACHE_TTL_SECONDS,
+            )
+        return response
+
     @log_db_metrics
     @backoff.on_exception(
         backoff.expo,
@@ -2686,17 +2809,26 @@ class PrismaClient:
         max_time=2,  # maximum total time to retry for
         on_backoff=on_backoff,  # specifying the function to call on backoff
     )
-    async def get_generic_data(
+    async def _get_generic_data_from_db(
         self,
         key: str,
         value: Any,
         table_name: Literal["users", "keys", "config", "spend"],
     ):
         """
-        Generic implementation of get data
+        DB-only path for `get_generic_data`. Split out so `@log_db_metrics`
+        and `@backoff` only run on actual DB queries — cache hits in the
+        public `get_generic_data` skip this method entirely.
+
+        Note: this changes the `call_type` label on DB service metrics
+        from "get_generic_data" to "_get_generic_data_from_db". Dashboards
+        filtering on the old label should be updated.
         """
         start_time = time.time()
         try:
+            # Initialise so future widening of the table_name set can't
+            # leave `response` unbound on an unmatched table.
+            response = None
             if table_name == "users":
                 response = await self.db.litellm_usertable.find_first(
                     where={key: value}  # type: ignore
@@ -2733,6 +2865,59 @@ class PrismaClient:
             )
 
             raise e
+
+    async def invalidate_config_param_cache(self, param_name: str) -> None:
+        """
+        Evict a cached LiteLLM_Config row from both in-memory and Redis
+        layers. Called from admin endpoints that write to LiteLLM_Config
+        (update/upsert/delete of general_settings,
+        model_cost_map_reload_config, anthropic_beta_headers_reload_config,
+        etc.). Without this, writes take up to
+        `_CONFIG_PARAM_CACHE_TTL_SECONDS` to be visible to readers on
+        other pods.
+        """
+        await self._config_param_cache.async_delete_cache(_config_cache_key(param_name))
+
+    @log_db_metrics
+    async def prefetch_config_params(self, param_names: List[str]) -> None:
+        """
+        Batch-fetch multiple LiteLLM_Config rows into the cache with a
+        single `find_many({"param_name": {"in": [...]}})` query.
+
+        Called at the start of the scheduler tick (`add_deployment`) so
+        subsequent per-param lookups via `get_generic_data` hit the cache
+        instead of issuing individual queries. Satisfies CLAUDE.md's
+        "No N+1 queries. Batch-fetch with `{'in': ids}` and distribute
+        in-memory."
+
+        Misses (params absent from DB) are cached as a sentinel string
+        so the next scheduler tick doesn't re-issue a single-row find_first.
+        """
+        if not param_names:
+            return
+        try:
+            rows = await self.db.litellm_config.find_many(
+                where={"param_name": {"in": param_names}}  # type: ignore
+            )
+        except Exception as e:
+            verbose_proxy_logger.debug(
+                "prefetch_config_params failed, falling through to per-param queries: %s",
+                e,
+            )
+            return
+        by_name = {row.param_name: row for row in rows}
+        for name in param_names:
+            row = by_name.get(name)
+            cache_value: Any = (
+                _row_to_cache_value(row)
+                if row is not None
+                else _CONFIG_PARAM_CACHE_MISS
+            )
+            await self._config_param_cache.async_set_cache(
+                _config_cache_key(name),
+                cache_value,
+                ttl=_CONFIG_PARAM_CACHE_TTL_SECONDS,
+            )
 
     async def _query_first_with_cached_plan_fallback(
         self, sql_query: str, *args
@@ -3310,6 +3495,14 @@ class PrismaClient:
 
                     tasks.append(updated_table_row)
                 await asyncio.gather(*tasks)
+                # Invalidate cache for every param we just upserted; the
+                # `save_config` → `insert_data(table_name="config")` path is
+                # the catch-all for general_settings / litellm_settings /
+                # environment_variables writes from the admin UI, and without
+                # this, those writes are stale on every pod for up to
+                # `_CONFIG_PARAM_CACHE_TTL_SECONDS`.
+                for k in data.keys():
+                    await self.invalidate_config_param_cache(k)
                 verbose_proxy_logger.info("Data Inserted into Config Table")
             elif table_name == "spend":
                 db_data = self.jsonify_object(data=data)
