@@ -1,9 +1,7 @@
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, model_validator
-
-from litellm.proxy._types import KeyRequestBase
+from pydantic import BaseModel, ConfigDict, model_validator
 
 
 class BulkUpdateKeyRequestItem(BaseModel):
@@ -45,21 +43,58 @@ class BulkUpdateKeyResponse(BaseModel):
     failed_updates: List[FailedKeyUpdate]
 
 
-class KeyUpdateFields(KeyRequestBase):
+class KeyUpdateFields(BaseModel):
     """
-    Mirror of UpdateKeyRequest minus per-key identifiers (`key`, `key_alias`)
-    and the scope guard (`team_id`). Used as the broadcast payload in
-    BulkUpdateTeamKeysRequest — one set of fields applied to many keys.
+    Allowlisted broadcast payload for /team/key/bulk_update.
+
+    This is an explicit allowlist (not a subset of UpdateKeyRequest) so that
+    security-sensitive fields — `allowed_routes`, `allowed_passthrough_routes`,
+    `user_id`, `team_id`, `organization_id`, `blocked`, `permissions`,
+    `object_permission`, `models`, `access_group_ids`, `config`,
+    `router_settings`, `key_type`, `key`/`key_alias`, etc. — can never be
+    broadcast to many keys at once, even by team admins. The bulk endpoint
+    intentionally has a narrower surface than `/key/update`: it covers the
+    common operational fields (budgets, rate limits, expiry, tags, metadata)
+    and nothing that affects RBAC, key ownership, or route access.
+
+    With `extra="forbid"`, any unknown field raises at request construction —
+    so adding a new field here is the only way to widen the surface, and any
+    new sensitive field added to UpdateKeyRequest in the future cannot leak in
+    by inheritance.
     """
 
-    duration: Optional[str] = None
-    spend: Optional[float] = None
-    metadata: Optional[dict] = None
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
+
+    # Budgets
+    max_budget: Optional[float] = None
+    budget_id: Optional[str] = None
+    budget_duration: Optional[str] = None
+    budget_limits: Optional[List[Any]] = None
+    model_max_budget: Optional[Dict[str, Any]] = None
+
+    # Rate limits
+    tpm_limit: Optional[int] = None
+    rpm_limit: Optional[int] = None
+    model_tpm_limit: Optional[Dict[str, Any]] = None
+    model_rpm_limit: Optional[Dict[str, Any]] = None
+    max_parallel_requests: Optional[int] = None
+    rpm_limit_type: Optional[
+        Literal["guaranteed_throughput", "best_effort_throughput", "dynamic"]
+    ] = None
+    tpm_limit_type: Optional[
+        Literal["guaranteed_throughput", "best_effort_throughput", "dynamic"]
+    ] = None
+
+    # Temporary budget grants (auto-expire). `spend` deliberately omitted — bulk-zeroing it bypasses budget enforcement; admin-only via /key/update.
     temp_budget_increase: Optional[float] = None
     temp_budget_expiry: Optional[datetime] = None
-    auto_rotate: Optional[bool] = None
-    rotation_interval: Optional[str] = None
-    organization_id: Optional[str] = None
+
+    # Expiry
+    duration: Optional[str] = None
+
+    # Operational metadata
+    tags: Optional[List[str]] = None
+    metadata: Optional[Dict[str, Any]] = None
 
     @model_validator(mode="after")
     def validate_temp_budget(self) -> "KeyUpdateFields":
@@ -71,18 +106,10 @@ class KeyUpdateFields(KeyRequestBase):
         return self
 
     @model_validator(mode="after")
-    def reject_per_key_or_scope_fields(self) -> "KeyUpdateFields":
-        forbidden = [
-            name
-            for name in ("key", "key_alias", "team_id")
-            if getattr(self, name, None) is not None
-        ]
-        if forbidden:
-            raise ValueError(
-                f"Fields not allowed in update_fields for bulk team key updates: "
-                f"{forbidden}. `key`/`key_alias` are per-key identifiers; `team_id` "
-                f"is the scope guard set at the request top level."
-            )
+    def require_at_least_one_field(self) -> "KeyUpdateFields":
+        # Reject empty payload — would iterate every key with no-op writes.
+        if not self.model_fields_set:
+            raise ValueError("update_fields must specify at least one field to update.")
         return self
 
 
